@@ -1,4 +1,4 @@
-pyrogram==2.0.106
-tgcrypto
+aiogram==3.10.0
 flask
-requests
+sqlalchemy
+pyngrok
