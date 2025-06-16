@@ -1,961 +1,500 @@
 #!/usr/bin/env python3
 import os
-import sqlite3
-import asyncio
-import logging
-import json
 import time
-import threading
+import sqlite3
 import uuid
+import threading
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, redirect, session, url_for
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.utils.deep_linking import create_start_link
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+from flask import Flask, render_template, request, redirect, url_for
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    Message,
+    CallbackQuery
+)
 
-# ======== CONFIGURATION ========
+# Configuration
+API_ID = 28593211
+API_HASH = "27ad7de4fe5cab9f8e310c5cc4b8d43d"
 BOT_TOKEN = "7555989501:AAFHBEasBpiiUi4ncmo2OQBvRZoF-mJI03c"
-ADMIN_ID = 5559075560  # Replace with your Telegram ID
-ADMIN_PASSWORD = "admin123"  # Set your admin password here
-DB_FILE = "bot_database.db"
-WALLET_INFO = "TRC20: TAbcdefghijk1234567890"  # Your wallet info
-REFERRAL_REWARD = 0.05  # USDT
-MIN_WITHDRAWAL = 0.05  # USDT
-NGROK_ENABLED = False  # Set to True if using ngrok
-WEB_SERVER_HOST = "0.0.0.0"
-# Use environment variable for port or default to 5001
-WEB_SERVER_PORT = int(os.environ.get("PORT", 5001))
-# ===============================
+ADMIN_ID = 5559075560
+MIN_WITHDRAW = 0.001  # Minimum withdrawal amount in LTC
+DB_NAME = "litecoin_bot.db"
+REF_REWARD = 0.0001   # Referral reward amount
+DAILY_BONUS = 0.00005 # Daily bonus amount
 
-# Initialize logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Initialize Flask
+# Initialize apps
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+bot = Client("litecoin_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Initialize Aiogram with correct parse mode settings
-bot = Bot(
-    token=BOT_TOKEN,
-    session=AiohttpSession(),
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
-dp = Dispatcher()
-
-# ======== DATABASE SETUP ========
+# Database setup
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        balance REAL DEFAULT 0.0,
-        referrals INTEGER DEFAULT 0,
-        referral_by INTEGER,
-        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Tasks table
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
-        task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_type TEXT,
-        title TEXT,
-        description TEXT,
-        url TEXT,
-        reward REAL,
-        cooldown INTEGER,
-        is_active BOOLEAN DEFAULT 1
-    )''')
-    
-    # Withdrawals table
-    c.execute('''CREATE TABLE IF NOT EXISTS withdrawals (
-        withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount REAL,
-        wallet TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(user_id)
-    )''')
-    
-    # Activity log
-    c.execute('''CREATE TABLE IF NOT EXISTS activity_log (
-        log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        task_id INTEGER,
-        reward REAL,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(user_id),
-        FOREIGN KEY(task_id) REFERENCES tasks(task_id)
-    )''')
-    
-    # Referrals table
-    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
-        referral_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        inviter_id INTEGER,
-        invited_id INTEGER UNIQUE,
-        reward_given BOOLEAN DEFAULT 0,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(inviter_id) REFERENCES users(user_id),
-        FOREIGN KEY(invited_id) REFERENCES users(user_id)
-    )''')
-    
-    # Insert default tasks if not exist
-    default_tasks = [
-        ('website', 'Visit Website', 'Visit our sponsor website for 10 seconds', 'https://example.com', 0.05, 3600),
-        ('channel', 'Join Channel', 'Join our official channel', '@fr10pro', 0.10, 86400),
-        ('ad', 'Watch Ad', 'Watch this promotional video', 'https://youtube.com/watch?v=abc123', 0.07, 7200)
-    ]
-    
-    for task in default_tasks:
-        c.execute("SELECT COUNT(*) FROM tasks WHERE title=?", (task[1],))
-        if c.fetchone()[0] == 0:
-            c.execute("INSERT INTO tasks (task_type, title, description, url, reward, cooldown) VALUES (?, ?, ?, ?, ?, ?)", task)
-    
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        # Users table
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0,
+            wallet TEXT,
+            referrer_id INTEGER,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_bonus TIMESTAMP
+        )''')
+        
+        # Tasks table
+        c.execute('''CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            task_type TEXT,
+            reward REAL,
+            content TEXT,
+            duration INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Transactions table
+        c.execute('''CREATE TABLE IF NOT EXISTS transactions (
+            tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            tx_type TEXT,
+            status TEXT DEFAULT 'pending',
+            address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # User tasks table
+        c.execute('''CREATE TABLE IF NOT EXISTS user_tasks (
+            user_id INTEGER,
+            task_id TEXT,
+            completed_at TIMESTAMP,
+            PRIMARY KEY (user_id, task_id)
+        )''')
+        
+        # Admins table
+        c.execute('''CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY
+        )''')
+        
+        # Insert main admin
+        try:
+            c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
+        except sqlite3.IntegrityError:
+            pass
+        conn.commit()
 
 init_db()
 
 # Database helper functions
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def get_user(user_id):
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close()
-    return user
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return c.fetchone()
 
-def create_user(user_id, username, full_name, referral_by=None):
-    conn = get_db()
-    conn.execute("INSERT OR IGNORE INTO users (user_id, username, full_name, referral_by) VALUES (?, ?, ?, ?)",
-                (user_id, username, full_name, referral_by))
-    conn.commit()
-    conn.close()
-    
-    # Handle referral
-    if referral_by:
-        update_referral_count(referral_by)
-        award_referral_bonus(referral_by, user_id)
+def create_user(user_id, referrer_id=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, referrer_id) VALUES (?, ?)", 
+                 (user_id, referrer_id))
+        conn.commit()
 
 def update_balance(user_id, amount):
-    conn = get_db()
-    conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-def update_referral_count(user_id):
-    conn = get_db()
-    conn.execute("UPDATE users SET referrals = referrals + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def award_referral_bonus(inviter_id, new_user_id):
-    conn = get_db()
-    # Check if already awarded
-    c = conn.execute("SELECT reward_given FROM referrals WHERE inviter_id = ? AND invited_id = ?", 
-                     (inviter_id, new_user_id))
-    existing = c.fetchone()
-    
-    if not existing or not existing['reward_given']:
-        # Award inviter
-        update_balance(inviter_id, REFERRAL_REWARD)
-        # Award new user
-        update_balance(new_user_id, REFERRAL_REWARD)
-        
-        # Log referral
-        conn.execute("INSERT OR REPLACE INTO referrals (inviter_id, invited_id, reward_given) VALUES (?, ?, 1)",
-                    (inviter_id, new_user_id))
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", 
+                 (amount, user_id))
         conn.commit()
-    conn.close()
 
-def get_tasks(task_type=None):
-    conn = get_db()
-    if task_type:
-        tasks = conn.execute("SELECT * FROM tasks WHERE task_type = ? AND is_active = 1", (task_type,)).fetchall()
-    else:
-        tasks = conn.execute("SELECT * FROM tasks WHERE is_active = 1").fetchall()
-    conn.close()
-    return tasks
+def add_transaction(user_id, amount, tx_type, address=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute('''INSERT INTO transactions 
+                  (user_id, amount, tx_type, address) 
+                  VALUES (?, ?, ?, ?)''',
+                  (user_id, amount, tx_type, address))
+        conn.commit()
+        return c.lastrowid
 
 def get_task(task_id):
-    conn = get_db()
-    task = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-    conn.close()
-    return task
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+        return c.fetchone()
 
-def log_activity(user_id, task_id, reward):
-    conn = get_db()
-    conn.execute("INSERT INTO activity_log (user_id, task_id, reward) VALUES (?, ?, ?)",
-                (user_id, task_id, reward))
-    conn.commit()
-    conn.close()
+def create_task(task_type, reward, content, duration=0):
+    task_id = str(uuid.uuid4())
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute('''INSERT INTO tasks 
+                  (task_id, task_type, reward, content, duration) 
+                  VALUES (?, ?, ?, ?, ?)''',
+                  (task_id, task_type, reward, content, duration))
+        conn.commit()
+    return task_id
 
-def can_do_task(user_id, task_id):
-    conn = get_db()
+def complete_task(user_id, task_id):
     task = get_task(task_id)
-    if not task: return False
+    if not task:
+        return False
     
-    # Check cooldown
-    last_done = conn.execute(
-        "SELECT timestamp FROM activity_log WHERE user_id = ? AND task_id = ? ORDER BY timestamp DESC LIMIT 1",
-        (user_id, task_id)
-    ).fetchone()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        try:
+            # Update balance
+            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                     (task['reward'], user_id))
+            
+            # Record completion
+            c.execute('''INSERT INTO user_tasks (user_id, task_id, completed_at)
+                      VALUES (?, ?, CURRENT_TIMESTAMP)''', 
+                     (user_id, task_id))
+            
+            # Record transaction
+            c.execute('''INSERT INTO transactions 
+                      (user_id, amount, tx_type) 
+                      VALUES (?, ?, 'task')''',
+                      (user_id, task['reward'],))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:  # Already completed
+            return False
+
+def get_pending_withdrawals():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM transactions WHERE tx_type = 'withdraw' AND status = 'pending'")
+        return c.fetchall()
+
+def update_withdrawal(tx_id, status):
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE transactions SET status = ? WHERE tx_id = ?", 
+                 (status, tx_id))
+        conn.commit()
+
+# Pyrogram Handlers
+@bot.on_message(filters.command("start"))
+async def start_command(client: Client, message: Message):
+    user_id = message.from_user.id
+    referrer_id = None
     
-    conn.close()
+    # Check for referral
+    if len(message.command) > 1:
+        try:
+            referrer_id = int(message.command[1])
+            create_user(referrer_id)  # Ensure referrer exists
+        except ValueError:
+            pass
     
-    if last_done:
-        last_time = datetime.strptime(last_done['timestamp'], "%Y-%m-%d %H:%M:%S")
-        cooldown = timedelta(seconds=task['cooldown'])
-        return datetime.now() > last_time + cooldown
-    return True
-
-def create_withdrawal(user_id, amount, wallet):
-    conn = get_db()
-    conn.execute("INSERT INTO withdrawals (user_id, amount, wallet) VALUES (?, ?, ?)",
-                (user_id, amount, wallet))
-    conn.commit()
-    conn.close()
-
-def get_withdrawals(status=None):
-    conn = get_db()
-    if status:
-        withdrawals = conn.execute("SELECT * FROM withdrawals WHERE status = ?", (status,)).fetchall()
-    else:
-        withdrawals = conn.execute("SELECT * FROM withdrawals").fetchall()
-    conn.close()
-    return withdrawals
-
-def get_withdrawal(wd_id):
-    conn = get_db()
-    withdrawal = conn.execute("SELECT * FROM withdrawals WHERE withdrawal_id = ?", (wd_id,)).fetchone()
-    conn.close()
-    return withdrawal
-
-def update_withdrawal(wd_id, status):
-    conn = get_db()
-    conn.execute("UPDATE withdrawals SET status = ? WHERE withdrawal_id = ?", (status, wd_id))
-    conn.commit()
-    conn.close()
-
-def get_stats():
-    conn = get_db()
-    stats = {
-        'total_users': conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        'active_users': conn.execute("SELECT COUNT(*) FROM users WHERE last_activity > datetime('now', '-1 day')").fetchone()[0],
-        'total_payouts': conn.execute("SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE status = 'approved'").fetchone()[0]
-    }
-    conn.close()
-    return stats
-
-# ======== TELEGRAM BOT HANDLERS ========
-class WithdrawState(StatesGroup):
-    waiting_for_wallet = State()
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    args = message.text.split()
-    referral_by = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    create_user(user_id, referrer_id)
+    user = get_user(user_id)
     
-    user = get_user(message.from_user.id)
-    if not user:
-        create_user(
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.full_name,
-            referral_by
-        )
+    # Award referral if applicable
+    if referrer_id and referrer_id != user_id:
+        update_balance(referrer_id, REF_REWARD)
+        add_transaction(referrer_id, REF_REWARD, 'referral')
     
-    await show_main_menu(message)
-
-async def show_main_menu(message: types.Message):
-    user = get_user(message.from_user.id)
-    if not user: return
-    
-    balance = user['balance']
-    referrals = user['referrals']
-    
-    text = (
-        f"👋 *Welcome, {message.from_user.full_name}!*\n\n"
-        f"💼 *Your Balance:* `{balance:.2f} USDT`\n"
-        f"👥 *Referrals:* `{referrals}`\n\n"
-        "📱 *Earn crypto by completing simple tasks!*"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Earn Coins", callback_data="earn_menu")],
+    # Send welcome message
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Earn LTC", callback_data="earn_menu")],
         [
-            InlineKeyboardButton(text="📊 Stats", callback_data="stats"),
-            InlineKeyboardButton(text="👨‍💼 Referrals", callback_data="referrals")
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard"),
+            InlineKeyboardButton("📊 My Stats", callback_data="stats")
         ],
-        [InlineKeyboardButton(text="💰 Withdraw", callback_data="withdraw_menu")]
+        [
+            InlineKeyboardButton("👥 Invite & Earn", callback_data="referral"),
+            InlineKeyboardButton("👛 Withdraw", callback_data="withdraw_menu")
+        ],
+        [InlineKeyboardButton("🎯 Daily Bonus", callback_data="daily_bonus")]
     ])
     
-    await message.answer(text, reply_markup=keyboard)
+    await message.reply_text(
+        f"🚀 **Welcome to Litecoin Click Bot!**\n\n"
+        f"💰 **Balance:** `{user['balance']:.6f} LTC`\n"
+        f"🔐 **Wallet:** `{user['wallet'] or 'Not set'}`\n\n"
+        "Complete tasks to earn LTC and withdraw to your wallet!",
+        reply_markup=keyboard
+    )
 
-@dp.callback_query(F.data == "main_menu")
-async def back_to_main(callback: types.CallbackQuery):
-    await callback.message.delete()
-    await show_main_menu(callback.message)
+@bot.on_callback_query(filters.regex("^earn_menu$"))
+async def earn_menu(client: Client, callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Visit Websites", callback_data="tasks_visit")],
+        [InlineKeyboardButton("📢 Join Channels", callback_data="tasks_join")],
+        [InlineKeyboardButton("📝 View Posts", callback_data="tasks_view")],
+        [InlineKeyboardButton("🎯 Custom Tasks", callback_data="tasks_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
+    ])
+    
+    await callback.edit_message_text(
+        "💼 **Available Tasks:**\n\n"
+        "Choose a task category to start earning LTC:",
+        reply_markup=keyboard
+    )
 
-@dp.callback_query(F.data == "earn_menu")
-async def earn_menu(callback: types.CallbackQuery):
-    tasks = get_tasks()
+@bot.on_callback_query(filters.regex("^tasks_"))
+async def show_tasks(client: Client, callback: CallbackQuery):
+    task_type = callback.data.split("_")[1]
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE task_type = ?", (task_type,))
+        tasks = c.fetchall()
     
     if not tasks:
-        await callback.answer("No tasks available at the moment", show_alert=True)
+        await callback.answer("No tasks available at the moment. Check back later!", show_alert=True)
         return
     
-    keyboard = InlineKeyboardBuilder()
-    
-    for task in tasks:
-        keyboard.add(InlineKeyboardButton(
-            text=f"{task['title']} (+{task['reward']:.2f} USDT)",
-            callback_data=f"task_{task['task_id']}"
-        ))
-    
-    keyboard.adjust(1)
-    keyboard.row(InlineKeyboardButton(text="🔙 Back", callback_data="main_menu"))
-    
-    await callback.message.edit_text(
-        "🎯 *Available Tasks*\n\n"
-        "Select a task to complete and earn USDT:",
-        reply_markup=keyboard.as_markup()
-    )
-
-@dp.callback_query(F.data.startswith("task_"))
-async def start_task(callback: types.CallbackQuery):
-    task_id = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-    task = get_task(task_id)
-    
-    if not task:
-        await callback.answer("Task not found", show_alert=True)
-        return
-    
-    if not can_do_task(user_id, task_id):
-        await callback.answer("You need to wait before doing this task again", show_alert=True)
-        return
-    
-    if task['task_type'] == 'website':
-        await handle_website_task(callback, task)
-    elif task['task_type'] == 'channel':
-        await handle_channel_task(callback, task)
-    elif task['task_type'] == 'ad':
-        await handle_ad_task(callback, task)
-
-async def handle_website_task(callback: types.CallbackQuery, task):
-    user_id = callback.from_user.id
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Visit Website", url=task['url'])],
-        [InlineKeyboardButton(text="✅ Done", callback_data=f"verify_website_{task['task_id']}")]
+    # For simplicity, show first task
+    task = tasks[0]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Complete Task", callback_data=f"do_task_{task['task_id']}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="earn_menu")]
     ])
     
-    await callback.message.edit_text(
-        f"🌐 *{task['title']}*\n\n"
-        f"{task['description']}\n\n"
-        f"⚠️ You must stay on the website for *10 seconds*",
+    await callback.edit_message_text(
+        f"**Task:** {task['content']}\n"
+        f"💎 **Reward:** `{task['reward']:.6f} LTC`\n"
+        f"⏱ **Duration:** {task['duration']} seconds",
         reply_markup=keyboard
     )
 
-@dp.callback_query(F.data.startswith("verify_website_"))
-async def verify_website(callback: types.CallbackQuery):
-    task_id = int(callback.data.split("_")[2])
+@bot.on_callback_query(filters.regex("^do_task_"))
+async def perform_task(client: Client, callback: CallbackQuery):
+    task_id = callback.data.split("_")[2]
     user_id = callback.from_user.id
-    task = get_task(task_id)
     
-    update_balance(user_id, task['reward'])
-    log_activity(user_id, task_id, task['reward'])
+    # Simulate task completion
+    await callback.edit_message_text("⏳ Processing task...")
+    time.sleep(2)  # Simulate task delay
     
-    await callback.message.edit_text(
-        f"✅ *Task Completed!*\n\n"
-        f"You earned: `+{task['reward']:.2f} USDT`\n"
-        f"New balance: `{get_user(user_id)['balance']:.2f} USDT`"
-    )
-
-async def handle_channel_task(callback: types.CallbackQuery, task):
-    user_id = callback.from_user.id
-    channel_username = task['url'].replace('@', '')
-    
-    try:
-        chat_member = await bot.get_chat_member(
-            chat_id=f"@{channel_username}",
-            user_id=user_id
-        )
-        is_member = chat_member.status in ['member', 'administrator', 'creator']
-    except:
-        is_member = False
-    
-    if is_member:
-        update_balance(user_id, task['reward'])
-        log_activity(user_id, task_id, task['reward'])
-        
-        await callback.message.edit_text(
-            f"✅ *Task Completed!*\n\n"
-            f"You earned: `+{task['reward']:.2f} USDT`\n"
-            f"New balance: `{get_user(user_id)['balance']:.2f} USDT`"
+    if complete_task(user_id, task_id):
+        user = get_user(user_id)
+        await callback.edit_message_text(
+            f"✅ **Task Completed!**\n\n"
+            f"➕ **Reward:** `{get_task(task_id)['reward']:.6f} LTC`\n"
+            f"💰 **New Balance:** `{user['balance']:.6f} LTC`"
         )
     else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Join Channel", url=f"https://t.me/{channel_username}")],
-            [InlineKeyboardButton(text="✅ Verify Join", callback_data=f"verify_channel_{task['task_id']}")]
-        ])
-        
-        await callback.message.edit_text(
-            f"👥 *{task['title']}*\n\n"
-            f"{task['description']}\n\n"
-            f"Join the channel and click verify:",
-            reply_markup=keyboard
-        )
+        await callback.answer("You've already completed this task!", show_alert=True)
 
-@dp.callback_query(F.data.startswith("verify_channel_"))
-async def verify_channel(callback: types.CallbackQuery):
-    task_id = int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    task = get_task(task_id)
-    channel_username = task['url'].replace('@', '')
-    
-    try:
-        chat_member = await bot.get_chat_member(
-            chat_id=f"@{channel_username}",
-            user_id=user_id
-        )
-        is_member = chat_member.status in ['member', 'administrator', 'creator']
-    except:
-        is_member = False
-    
-    if is_member:
-        update_balance(user_id, task['reward'])
-        log_activity(user_id, task_id, task['reward'])
-        
-        await callback.message.edit_text(
-            f"✅ *Task Completed!*\n\n"
-            f"You earned: `+{task['reward']:.2f} USDT`\n"
-            f"New balance: `{get_user(user_id)['balance']:.2f} USDT`"
-        )
-    else:
-        await callback.answer("You haven't joined the channel yet", show_alert=True)
-
-async def handle_ad_task(callback: types.CallbackQuery, task):
-    user_id = callback.from_user.id
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 View Ad", callback_data=f"view_ad_{task['task_id']}")]
+@bot.on_callback_query(filters.regex("^withdraw_menu$"))
+async def withdraw_menu(client: Client, callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Set Wallet", callback_data="set_wallet")],
+        [InlineKeyboardButton("🚀 Request Withdrawal", callback_data="req_withdraw")],
+        [InlineKeyboardButton("📜 Withdrawal History", callback_data="withdraw_history")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
     ])
     
-    await callback.message.edit_text(
-        f"📺 *{task['title']}*\n\n"
-        f"{task['description']}\n\n"
-        f"Click below to watch the ad:",
+    await callback.edit_message_text(
+        f"💳 **Withdrawal Menu**\n\n"
+        f"⚖️ **Minimum:** `{MIN_WITHDRAW:.6f} LTC`\n"
+        f"💰 **Your Balance:** `{user['balance']:.6f} LTC`\n"
+        f"🔐 **Wallet:** `{user['wallet'] or 'Not set'}`",
         reply_markup=keyboard
     )
 
-@dp.callback_query(F.data.startswith("view_ad_"))
-async def view_ad(callback: types.CallbackQuery):
-    task_id = int(callback.data.split("_")[2])
-    task = get_task(task_id)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Open Content", url=task['url'])],
-        [InlineKeyboardButton(text="⏳ Start Timer (10s)", callback_data=f"start_timer_{task_id}")]
-    ])
-    
-    await callback.message.edit_text(
-        f"⏱ *Watch the Ad*\n\n"
-        f"Please watch the content for at least 10 seconds",
-        reply_markup=keyboard
+@bot.on_callback_query(filters.regex("^set_wallet$"))
+async def set_wallet(client: Client, callback: CallbackQuery):
+    await callback.edit_message_text(
+        "🔐 **Set Your Litecoin Wallet:**\n\n"
+        "Please send your Litecoin wallet address:"
     )
+    # Store state for next message
+    # (In production, use a proper state management system)
 
-@dp.callback_query(F.data.startswith("start_timer_"))
-async def start_timer(callback: types.CallbackQuery):
-    task_id = int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    task = get_task(task_id)
+@bot.on_message(filters.text & filters.private & ~filters.command)
+async def handle_wallet_input(client: Client, message: Message):
+    # Simplified wallet handler (in production, add validation)
+    wallet = message.text.strip()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET wallet = ? WHERE user_id = ?", 
+                 (wallet, message.from_user.id))
+        conn.commit()
     
-    # Start countdown
-    msg = await callback.message.edit_text("🕒 10 seconds remaining...")
-    for i in range(9, 0, -1):
-        await asyncio.sleep(1)
-        await msg.edit_text(f"🕒 {i} seconds remaining...")
-    
-    await asyncio.sleep(1)
-    update_balance(user_id, task['reward'])
-    log_activity(user_id, task_id, task['reward'])
-    
-    await msg.edit_text(
-        f"✅ *Task Completed!*\n\n"
-        f"You earned: `+{task['reward']:.2f} USDT`\n"
-        f"New balance: `{get_user(user_id)['balance']:.2f} USDT`"
-    )
+    await message.reply_text(f"✅ Wallet set to: `{wallet}`")
 
-@dp.callback_query(F.data == "stats")
-async def show_stats(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id)
-    stats = get_stats()
-    
-    text = (
-        f"📊 *Your Statistics*\n\n"
-        f"💰 Balance: `{user['balance']:.2f} USDT`\n"
-        f"👥 Referrals: `{user['referrals']}`\n\n"
-        f"🌐 *Global Stats*\n"
-        f"👤 Total Users: `{stats['total_users']}`\n"
-        f"🔥 Active Users: `{stats['active_users']}`\n"
-        f"💸 Total Payouts: `{stats['total_payouts']:.2f} USDT`"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-
-@dp.callback_query(F.data == "referrals")
-async def show_referrals(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id)
-    referral_link = await create_start_link(bot, str(user['user_id']), encode=True)
-    
-    text = (
-        f"👥 *Referral Program*\n\n"
-        f"🔗 Your referral link:\n`{referral_link}`\n\n"
-        f"💸 Earn `{REFERRAL_REWARD:.2f} USDT` for each friend who joins using your link!\n"
-        f"👤 Your referrals: `{user['referrals']}`\n"
-        f"💰 Total earned: `{user['referrals'] * REFERRAL_REWARD:.2f} USDT`"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Share Link", 
-         switch_inline_query=f"Earn crypto with me! {referral_link}")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-
-@dp.callback_query(F.data == "withdraw_menu")
-async def withdraw_menu(callback: types.CallbackQuery, state: FSMContext):
+@bot.on_callback_query(filters.regex("^req_withdraw$"))
+async def request_withdrawal(client: Client, callback: CallbackQuery):
     user = get_user(callback.from_user.id)
     
-    if user['balance'] < MIN_WITHDRAWAL:
+    if not user['wallet']:
+        await callback.answer("Please set your wallet first!", show_alert=True)
+        return
+    
+    if user['balance'] < MIN_WITHDRAW:
         await callback.answer(
-            f"Minimum withdrawal amount is {MIN_WITHDRAWAL} USDT", 
+            f"Minimum withdrawal is {MIN_WITHDRAW:.6f} LTC!", 
             show_alert=True
         )
         return
     
-    text = (
-        f"💰 *Withdraw Funds*\n\n"
-        f"Your balance: `{user['balance']:.2f} USDT`\n"
-        f"Minimum withdrawal: `{MIN_WITHDRAWAL} USDT`\n\n"
-        f"Please send your TRC20/BEP20 wallet address:"
+    tx_id = add_transaction(
+        user_id=user['user_id'],
+        amount=user['balance'],
+        tx_type='withdraw',
+        address=user['wallet']
     )
     
-    await callback.message.edit_text(text)
-    await state.set_state(WithdrawState.waiting_for_wallet)
-
-@dp.message(WithdrawState.waiting_for_wallet)
-async def process_withdrawal(message: types.Message, state: FSMContext):
-    user = get_user(message.from_user.id)
-    wallet_address = message.text.strip()
+    # Reset balance
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = 0 WHERE user_id = ?", (user['user_id'],))
+        conn.commit()
     
-    # Basic validation
-    if len(wallet_address) < 20:
-        await message.answer("❌ Invalid wallet address. Please try again.")
-        return
-    
-    if user['balance'] < MIN_WITHDRAWAL:
-        await message.answer(f"❌ Your balance is below the minimum withdrawal of {MIN_WITHDRAWAL} USDT")
-        await state.clear()
-        return
-    
-    # Create withdrawal request
-    create_withdrawal(message.from_user.id, user['balance'], wallet_address)
-    update_balance(message.from_user.id, -user['balance'])
+    await callback.edit_message_text(
+        "📬 **Withdrawal Request Sent!**\n\n"
+        "Your withdrawal is pending admin approval. "
+        "You'll be notified when processed."
+    )
     
     # Notify admin
     await bot.send_message(
         ADMIN_ID,
-        f"⚠️ *New Withdrawal Request*\n\n"
-        f"👤 User: [{message.from_user.full_name}](tg://user?id={message.from_user.id})\n"
-        f"💳 Wallet: `{wallet_address}`\n"
-        f"💸 Amount: `{user['balance']:.2f} USDT`\n\n"
-        "Use /withdrawals to manage requests"
+        f"⚠️ **New Withdrawal Request**\n\n"
+        f"👤 User: {callback.from_user.mention}\n"
+        f"💳 Wallet: `{user['wallet']}`\n"
+        f"💎 Amount: `{user['balance']:.6f} LTC`\n"
+        f"📋 TX ID: `{tx_id}`"
     )
-    
-    await message.answer(
-        "✅ *Withdrawal Request Submitted!*\n\n"
-        "Your request has been sent for approval. "
-        "Administrator will process it within 24 hours."
-    )
-    await state.clear()
 
-# ======== ADMIN COMMANDS ========
-@dp.message(Command("admin"))
-async def admin_menu(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📤 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="🛠 Manage Tasks", callback_data="manage_tasks")],
-        [InlineKeyboardButton(text="💳 Withdrawals", callback_data="admin_withdrawals")],
+# Admin commands
+@bot.on_message(filters.command("admin") & filters.user(ADMIN_ID))
+async def admin_panel(client: Client, message: Message):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📝 Create Task", callback_data="admin_create_task")],
+        [InlineKeyboardButton("📋 Withdrawals", callback_data="admin_withdrawals")]
     ])
     
-    await message.answer("👑 *Admin Panel*", reply_markup=keyboard)
+    await message.reply_text("🔧 **Admin Panel**", reply_markup=keyboard)
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
-    stats = get_stats()
-    
-    text = (
-        "📊 *Admin Statistics*\n\n"
-        f"👤 Total Users: `{stats['total_users']}`\n"
-        f"🔥 Active Users: `{stats['active_users']}`\n"
-        f"💸 Total Payouts: `{stats['total_payouts']:.2f} USDT`"
-    )
-    
-    await callback.message.edit_text(text)
-
-@dp.callback_query(F.data == "admin_withdrawals")
-async def admin_withdrawals(callback: types.CallbackQuery):
-    withdrawals = get_withdrawals('pending')
+@bot.on_callback_query(filters.regex("^admin_withdrawals$") & filters.user(ADMIN_ID))
+async def show_withdrawals(client: Client, callback: CallbackQuery):
+    withdrawals = get_pending_withdrawals()
     
     if not withdrawals:
         await callback.answer("No pending withdrawals", show_alert=True)
         return
     
-    text = "⏳ *Pending Withdrawals*\n\n"
-    keyboard = InlineKeyboardBuilder()
+    # Show first withdrawal for simplicity
+    wd = withdrawals[0]
+    user = get_user(wd['user_id'])
     
-    for wd in withdrawals:
-        user = get_user(wd['user_id'])
-        text += (
-            f"💳 #{wd['withdrawal_id']}\n"
-            f"👤 User: [{user['full_name']}](tg://user?id={user['user_id']})\n"
-            f"💸 Amount: `{wd['amount']:.2f} USDT`\n"
-            f"🔗 Wallet: `{wd['wallet']}`\n\n"
-        )
-        keyboard.add(InlineKeyboardButton(
-            text=f"Approve #{wd['withdrawal_id']}",
-            callback_data=f"approve_wd_{wd['withdrawal_id']}"
-        ))
-        keyboard.add(InlineKeyboardButton(
-            text=f"Reject #{wd['withdrawal_id']}",
-            callback_data=f"reject_wd_{wd['withdrawal_id']}"
-        ))
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"wd_approve_{wd['tx_id']}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"wd_reject_{wd['tx_id']}")
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+    ])
     
-    keyboard.adjust(2)
-    await callback.message.edit_text(text, reply_markup=keyboard.as_markup())
-
-@dp.callback_query(F.data.startswith("approve_wd_"))
-async def approve_withdrawal(callback: types.CallbackQuery):
-    wd_id = int(callback.data.split("_")[2])
-    withdrawal = get_withdrawal(wd_id)
-    if not withdrawal:
-        await callback.answer("Withdrawal not found", show_alert=True)
-        return
-        
-    user = get_user(withdrawal['user_id'])
-    if not user:
-        await callback.answer("User not found", show_alert=True)
-        return
-    
-    # Update status
-    update_withdrawal(wd_id, 'approved')
-    
-    # Notify user
-    await bot.send_message(
-        user['user_id'],
-        f"✅ *Withdrawal Approved!*\n\n"
-        f"Your withdrawal of `{withdrawal['amount']:.2f} USDT` has been approved.\n"
-        f"Funds have been sent to your wallet."
+    await callback.edit_message_text(
+        f"📋 **Withdrawal Request**\n\n"
+        f"👤 User: {user['user_id']}\n"
+        f"💳 Wallet: `{wd['address']}`\n"
+        f"💎 Amount: `{wd['amount']:.6f} LTC`"
     )
+
+@bot.on_callback_query(filters.regex("^wd_") & filters.user(ADMIN_ID))
+async def handle_withdrawal_action(client: Client, callback: CallbackQuery):
+    action, tx_id = callback.data.split("_")[1:]
+    tx_id = int(tx_id)
     
-    await callback.answer("Withdrawal approved!", show_alert=True)
-    await callback.message.delete()
-
-@dp.callback_query(F.data.startswith("reject_wd_"))
-async def reject_withdrawal(callback: types.CallbackQuery):
-    wd_id = int(callback.data.split("_")[2])
-    withdrawal = get_withdrawal(wd_id)
-    if not withdrawal:
-        await callback.answer("Withdrawal not found", show_alert=True)
-        return
-        
-    user = get_user(withdrawal['user_id'])
-    if not user:
-        await callback.answer("User not found", show_alert=True)
-        return
+    if action == "approve":
+        update_withdrawal(tx_id, "approved")
+        await callback.answer("Withdrawal approved!", show_alert=True)
+    elif action == "reject":
+        update_withdrawal(tx_id, "rejected")
+        # Return funds to user
+        with sqlite3.connect(DB_NAME) as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id, amount FROM transactions WHERE tx_id = ?", (tx_id,))
+            tx = c.fetchone()
+            if tx:
+                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                         (tx[1], tx[0]))
+                conn.commit()
+        await callback.answer("Withdrawal rejected!", show_alert=True)
     
-    # Update status and refund
-    update_withdrawal(wd_id, 'rejected')
-    update_balance(user['user_id'], withdrawal['amount'])
-    
-    # Notify user
-    await bot.send_message(
-        user['user_id'],
-        f"❌ *Withdrawal Rejected*\n\n"
-        f"Your withdrawal of `{withdrawal['amount']:.2f} USDT` was rejected.\n"
-        f"Funds have been returned to your balance."
-    )
-    
-    await callback.answer("Withdrawal rejected!", show_alert=True)
-    await callback.message.delete()
+    await callback.edit_message_text("✅ Action completed")
 
-# ======== FLASK WEB PANEL ========
-# HTML Templates
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Admin Login</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        body { background-color: #f8f9fa; }
-        .card { border-radius: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        .btn-primary { background-color: #0d6efd; border: none; }
-        .btn-primary:hover { background-color: #0b5ed7; }
-    </style>
-</head>
-<body class="bg-light">
-    <div class="container py-5">
-        <div class="row justify-content-center">
-            <div class="col-md-6">
-                <div class="card shadow-sm">
-                    <div class="card-body p-4">
-                        <h2 class="card-title text-center mb-4">Admin Login</h2>
-                        <form method="POST">
-                            <div class="mb-3">
-                                <label for="token" class="form-label">Password</label>
-                                <input type="password" class="form-control" id="token" name="token" required>
-                            </div>
-                            <button type="submit" class="btn btn-primary w-100">Login</button>
-                        </form>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Admin Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        :root {
-            --primary: #0d6efd;
-            --secondary: #6c757d;
-            --success: #198754;
-            --danger: #dc3545;
-            --warning: #ffc107;
-            --info: #0dcaf0;
-        }
-        body { background-color: #f8f9fa; }
-        .navbar { box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .card { border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
-        .card-header { border-radius: 10px 10px 0 0 !important; }
-        .display-4 { font-size: 2.5rem; font-weight: 300; }
-        .badge-pending { background-color: var(--warning); color: #000; }
-        .badge-approved { background-color: var(--success); }
-        .badge-rejected { background-color: var(--danger); }
-        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.875rem; }
-    </style>
-</head>
-<body class="bg-light">
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
-        <div class="container">
-            <a class="navbar-brand" href="#">Crypto Bot Admin</a>
-            <div class="d-flex">
-                <a href="/admin/logout" class="btn btn-outline-light">Logout</a>
-            </div>
-        </div>
-    </nav>
-    
-    <div class="container py-4">
-        <div class="row">
-            <div class="col-md-4 mb-4">
-                <div class="card shadow-sm h-100">
-                    <div class="card-body text-center">
-                        <h5 class="card-title text-secondary">Total Users</h5>
-                        <p class="display-4 text-primary">{{ stats.total_users }}</p>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card shadow-sm h-100">
-                    <div class="card-body text-center">
-                        <h5 class="card-title text-secondary">Active Users</h5>
-                        <p class="display-4 text-success">{{ stats.active_users }}</p>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card shadow-sm h-100">
-                    <div class="card-body text-center">
-                        <h5 class="card-title text-secondary">Total Payouts</h5>
-                        <p class="display-4 text-info">{{ stats.total_payouts }} USDT</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="row">
-            <div class="col-12">
-                <div class="card shadow-sm mb-4">
-                    <div class="card-header bg-white">
-                        <h5 class="mb-0">Pending Withdrawals</h5>
-                    </div>
-                    <div class="card-body">
-                        {% if withdrawals %}
-                        <div class="table-responsive">
-                            <table class="table table-hover align-middle">
-                                <thead class="table-light">
-                                    <tr>
-                                        <th>ID</th>
-                                        <th>User ID</th>
-                                        <th>Amount</th>
-                                        <th>Wallet</th>
-                                        <th>Status</th>
-                                        <th>Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {% for wd in withdrawals %}
-                                    <tr>
-                                        <td>#{{ wd.withdrawal_id }}</td>
-                                        <td>{{ wd.user_id }}</td>
-                                        <td>{{ wd.amount }} USDT</td>
-                                        <td><code>{{ wd.wallet }}</code></td>
-                                        <td>
-                                            <span class="badge badge-pending">{{ wd.status }}</span>
-                                        </td>
-                                        <td>
-                                            <a href="/admin/approve_withdrawal/{{ wd.withdrawal_id }}" class="btn btn-sm btn-success">Approve</a>
-                                            <a href="/admin/reject_withdrawal/{{ wd.withdrawal_id }}" class="btn btn-sm btn-danger">Reject</a>
-                                        </td>
-                                    </tr>
-                                    {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-                        {% else %}
-                        <div class="text-center py-4">
-                            <h4 class="text-muted">No pending withdrawals</h4>
-                            <p class="text-secondary">All withdrawal requests have been processed</p>
-                        </div>
-                        {% endif %}
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="card shadow-sm">
-            <div class="card-header bg-white">
-                <h5 class="mb-0">Payout Wallet Information</h5>
-            </div>
-            <div class="card-body text-center">
-                <p class="lead"><code>{{ wallet_info }}</code></p>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        password = request.form.get('token')
-        if password == ADMIN_PASSWORD:
-            session['admin'] = True
-            return redirect(url_for('admin_dashboard'))
-        return render_template_string(LOGIN_HTML, error="Invalid password"), 401
-    return render_template_string(LOGIN_HTML)
-
-@app.route('/admin/logout')
-def admin_logout():
-    session.pop('admin', None)
-    return redirect(url_for('admin_login'))
-
-@app.route('/admin')
+# Flask Admin Panel
+@app.route('/admin', methods=['GET'])
 def admin_dashboard():
-    if not session.get('admin'):
-        return redirect(url_for('admin_login'))
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users_count = c.fetchone()[0]
+        
+        c.execute("SELECT SUM(balance) FROM users")
+        total_balance = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM transactions WHERE tx_type = 'withdraw' AND status = 'pending'")
+        pending_wd = c.fetchone()[0]
     
-    stats = get_stats()
-    withdrawals = get_withdrawals('pending')
-    
-    return render_template_string(
-        DASHBOARD_HTML, 
-        stats=stats,
-        withdrawals=withdrawals,
-        wallet_info=WALLET_INFO
+    return render_template(
+        'admin_dashboard.html',
+        users_count=users_count,
+        total_balance=total_balance,
+        pending_wd=pending_wd
     )
 
-@app.route('/admin/approve_withdrawal/<int:wd_id>')
-def approve_withdrawal_web(wd_id):
-    if not session.get('admin'):
-        return redirect(url_for('admin_login'))
+@app.route('/admin/tasks', methods=['GET', 'POST'])
+def manage_tasks():
+    if request.method == 'POST':
+        task_type = request.form.get('task_type')
+        reward = float(request.form.get('reward'))
+        content = request.form.get('content')
+        duration = int(request.form.get('duration', 0))
+        
+        create_task(task_type, reward, content, duration)
+        return redirect(url_for('manage_tasks'))
     
-    update_withdrawal(wd_id, 'approved')
-    return redirect(url_for('admin_dashboard'))
-
-@app.route('/admin/reject_withdrawal/<int:wd_id>')
-def reject_withdrawal_web(wd_id):
-    if not session.get('admin'):
-        return redirect(url_for('admin_login'))
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        tasks = c.fetchall()
     
-    withdrawal = get_withdrawal(wd_id)
-    if withdrawal:
-        update_balance(withdrawal['user_id'], withdrawal['amount'])
-        update_withdrawal(wd_id, 'rejected')
-    return redirect(url_for('admin_dashboard'))
+    return render_template('admin_tasks.html', tasks=tasks)
 
-# ======== START APPLICATION ========
-async def on_startup():
-    logger.info("Bot started")
-    # Skip any pending updates
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Bot is ready and polling for updates")
+@app.route('/admin/withdrawals', methods=['GET'])
+def manage_withdrawals():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute('''SELECT t.*, u.user_id 
+                  FROM transactions t 
+                  JOIN users u ON t.user_id = u.user_id
+                  WHERE t.tx_type = 'withdraw' AND t.status = 'pending' ''')
+        withdrawals = c.fetchall()
+    
+    return render_template('admin_withdrawals.html', withdrawals=withdrawals)
 
+@app.route('/admin/withdrawals/<action>/<tx_id>')
+def handle_withdrawal(action, tx_id):
+    update_withdrawal(tx_id, action)
+    return redirect(url_for('manage_withdrawals'))
+
+# Start applications
 def run_flask():
-    port = WEB_SERVER_PORT
-    logger.info(f"Starting Flask on port {port}")
-    app.run(host=WEB_SERVER_HOST, port=port)
-
-async def run_bot():
-    await on_startup()
-    await dp.start_polling(bot)
+    app.run(host='0.0.0.0', port=5000, use_reloader=False)
 
 if __name__ == "__main__":
-    logger.info(f"Starting Crypto Earning Bot")
-    logger.info(f"Admin password: {ADMIN_PASSWORD}")
-    logger.info(f"Web panel: http://localhost:{WEB_SERVER_PORT}/admin/login")
-    
     # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
     flask_thread.start()
     
-    # Start Aiogram bot in the main thread
-    asyncio.run(run_bot())
+    # Start the bot
+    print("Starting Telegram bot...")
+    bot.run()
