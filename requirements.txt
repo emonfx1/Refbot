@@ -1,4 +1,4 @@
-aiogram==3.10.0
+pyrogram
 flask
-sqlalchemy
-pyngrok
+sqlite3
+uuid
